@@ -1,0 +1,120 @@
+name: compute
+
+# Fan a CPU-heavy job out over N parallel runners, merge the pieces, publish a release.
+# Start a run either from the Actions tab (workflow_dispatch) or by pushing a
+# request file under requests/ (see README).
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "Folder name under jobs/"
+        required: true
+      shards:
+        description: "Number of parallel runners (1-20)"
+        default: "20"
+      tag:
+        description: "Release tag (default: <job>-<UTC timestamp>)"
+        required: false
+  push:
+    paths:
+      - "requests/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compute-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      job: ${{ steps.plan.outputs.job }}
+      shards: ${{ steps.plan.outputs.shards }}
+      tag: ${{ steps.plan.outputs.tag }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      run: ${{ steps.plan.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: plan
+        env:
+          IN_JOB: ${{ inputs.job }}
+          IN_SHARDS: ${{ inputs.shards }}
+          IN_TAG: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: python3 scripts/plan.py
+
+  compute:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      JOB: ${{ needs.plan.outputs.job }}
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ needs.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Setup
+        run: |
+          cd "jobs/$JOB"
+          if [ -f setup.sh ]; then bash setup.sh; fi
+      - name: Run shard
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cd "jobs/$JOB"
+          bash run.sh "$SHARD" "$SHARDS" "$GITHUB_WORKSPACE/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    needs: [plan, compute]
+    runs-on: ubuntu-latest
+    env:
+      JOB: ${{ needs.plan.outputs.job }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SHARDS: ${{ needs.plan.outputs.shards }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-*
+          path: shards
+          merge-multiple: true
+      - name: Merge
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cd "jobs/$JOB"
+          if [ -f merge.sh ]; then
+            bash merge.sh "$GITHUB_WORKSPACE/shards" "$GITHUB_WORKSPACE/dist"
+          else
+            (cd "$GITHUB_WORKSPACE/shards" && tar czf "$GITHUB_WORKSPACE/dist/$JOB.tar.gz" .)
+          fi
+          ls -la "$GITHUB_WORKSPACE/dist"
+      - name: Publish release
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$JOB · $TAG" \
+            --notes "Job \`$JOB\`, $SHARDS parallel shards. Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
